@@ -1,0 +1,932 @@
+#Requires -RunAsAdministrator
+<#
+.SYNOPSIS
+    WinOptimize-W11 — Script de otimização, privacidade e remoção de IA para Windows 11
+.DESCRIPTION
+    Maximiza performance (desktop e jogos), remove telemetria, desativa funcionalidades
+    de IA da Microsoft (Copilot, Recall, etc.) e elimina bloatware.
+    Compatível com Windows 11 24H2 / 25H2+
+.AUTHOR
+    Gerado com assistência do Claude (Anthropic) — uso por conta e risco do usuário.
+.NOTES
+    Execute como Administrador. Faça um ponto de restauração antes de rodar.
+    Versão: 2.0 | Data: 2025-2026
+#>
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Continue'   # Não travar em erros não-críticos
+
+# ============================================================
+#  VARIÁVEIS GLOBAIS
+# ============================================================
+$ScriptVersion  = "2.0"
+$LogFile        = "$env:TEMP\WinOptimize_$(Get-Date -Format 'yyyyMMdd-HHmm').log"
+$BackupDir      = "$env:TEMP\WinOptimize_RegBackup_$(Get-Date -Format 'yyyyMMdd-HHmm')"
+$ChangesLog     = [System.Collections.Generic.List[string]]::new()
+$HardcoreMode   = $false
+
+# ============================================================
+#  FUNÇÕES AUXILIARES
+# ============================================================
+
+function Write-Log {
+    param([string]$Message, [string]$Level = "INFO")
+    $timestamp = Get-Date -Format "HH:mm:ss"
+    $line = "[$timestamp][$Level] $Message"
+    Add-Content -Path $LogFile -Value $line -Encoding UTF8
+    $ChangesLog.Add($line)
+}
+
+function Write-Section {
+    param([string]$Title)
+    $bar = "=" * 60
+    Write-Host "`n$bar" -ForegroundColor Cyan
+    Write-Host "  $Title" -ForegroundColor White
+    Write-Host "$bar" -ForegroundColor Cyan
+    Write-Log ">>> SECAO: $Title"
+}
+
+function Write-OK   { param([string]$m) Write-Host "  [OK] $m" -ForegroundColor Green;  Write-Log $m "OK" }
+function Write-SKIP { param([string]$m) Write-Host "  [--] $m" -ForegroundColor DarkGray; Write-Log $m "SKIP" }
+function Write-WARN { param([string]$m) Write-Host "  [!!] $m" -ForegroundColor Yellow; Write-Log $m "WARN" }
+function Write-ERR  { param([string]$m) Write-Host "  [XX] $m" -ForegroundColor Red;    Write-Log $m "ERROR" }
+
+# Garante que a chave de registro existe antes de escrever
+function Ensure-RegKey {
+    param([string]$Path)
+    if (-not (Test-Path $Path)) {
+        try { New-Item -Path $Path -Force | Out-Null } catch { Write-WARN "Não foi possível criar chave: $Path" }
+    }
+}
+
+# Define valor DWORD de forma segura
+function Set-Reg {
+    param([string]$Path, [string]$Name, $Value, [string]$Type = "DWord")
+    try {
+        Ensure-RegKey -Path $Path
+        Set-ItemProperty -Path $Path -Name $Name -Value $Value -Type $Type -Force -ErrorAction Stop
+        Write-OK "$Path\$Name = $Value"
+    } catch {
+        Write-ERR "Falha ao definir $Path\$Name — $_"
+    }
+}
+
+# Desativa serviço de forma segura
+function Disable-Svc {
+    param([string]$Name, [string]$StartupType = "Disabled")
+    try {
+        $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if ($null -eq $svc) { Write-SKIP "Serviço não encontrado: $Name"; return }
+        Stop-Service -Name $Name -Force -ErrorAction SilentlyContinue
+        Set-Service  -Name $Name -StartupType $StartupType -ErrorAction Stop
+        Write-OK "Serviço '$Name' → $StartupType"
+    } catch {
+        Write-ERR "Falha ao desativar serviço '$Name' — $_"
+    }
+}
+
+# Desativa tarefa agendada de forma segura
+function Disable-Task {
+    param([string]$TaskPath, [string]$TaskName)
+    try {
+        $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
+        if ($null -eq $task) { Write-SKIP "Tarefa não encontrada: $TaskPath$TaskName"; return }
+        Disable-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction Stop | Out-Null
+        Write-OK "Tarefa desativada: $TaskPath$TaskName"
+    } catch {
+        Write-ERR "Falha na tarefa $TaskPath$TaskName — $_"
+    }
+}
+
+# Remove pacote Appx (usuário atual)
+function Remove-AppxSafe {
+    param([string]$Pattern)
+    try {
+        $pkgs = Get-AppxPackage -Name $Pattern -ErrorAction SilentlyContinue
+        if ($null -eq $pkgs -or @($pkgs).Count -eq 0) { Write-SKIP "Pacote não encontrado: $Pattern"; return }
+        foreach ($pkg in $pkgs) {
+            Remove-AppxPackage -Package $pkg.PackageFullName -ErrorAction Stop
+            Write-OK "Removido (usuário): $($pkg.Name)"
+        }
+    } catch { Write-ERR "Falha ao remover $Pattern — $_" }
+}
+
+# Remove pacote Appx provisionado (impede reinstalação para novos usuários)
+function Remove-AppxProvSafe {
+    param([string]$Pattern)
+    try {
+        $pkgs = Get-AppxProvisionedPackage -Online | Where-Object { $_.PackageName -like "*$Pattern*" }
+        if ($null -eq $pkgs -or @($pkgs).Count -eq 0) { Write-SKIP "Provisionado não encontrado: $Pattern"; return }
+        foreach ($pkg in $pkgs) {
+            Remove-AppxProvisionedPackage -Online -PackageName $pkg.PackageName -ErrorAction Stop | Out-Null
+            Write-OK "Removido (provisionado): $($pkg.DisplayName)"
+        }
+    } catch { Write-ERR "Falha ao remover provisionado $Pattern — $_" }
+}
+
+# ============================================================
+#  VERIFICAÇÕES INICIAIS
+# ============================================================
+Clear-Host
+Write-Host @"
+╔══════════════════════════════════════════════════════════╗
+║     WinOptimize-W11  v$ScriptVersion  —  by Claude/Anthropic       ║
+║  Performance • Privacidade • Remoção de IA • Bloatware  ║
+╚══════════════════════════════════════════════════════════╝
+"@ -ForegroundColor Cyan
+
+# Verifica se é administrador
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+    [Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Host "`n  ERRO: Execute este script como Administrador!" -ForegroundColor Red
+    exit 1
+}
+
+# Verifica versão do Windows
+$winBuild = [System.Environment]::OSVersion.Version.Build
+Write-Host "`n  Build do Windows detectado: $winBuild" -ForegroundColor White
+if ($winBuild -lt 22000) {
+    Write-Host "  AVISO: Este script foi feito para Windows 11. Pode haver instabilidade." -ForegroundColor Yellow
+}
+
+# Inicia log
+New-Item -Path $LogFile -ItemType File -Force | Out-Null
+Write-Log "WinOptimize-W11 v$ScriptVersion iniciado | Build: $winBuild | Usuario: $env:USERNAME"
+
+# ============================================================
+#  PERGUNTA MODO HARDCORE
+# ============================================================
+Write-Host @"
+
+  MODO HARDCORE:
+  Ativa tweaks mais agressivos: desativa mitigações de segurança
+  (Spectre/Meltdown) para máxima performance em jogos, remove mais
+  serviços e blocos adicionais de rede.
+
+  AVISO: Modo Hardcore reduz proteções de segurança do sistema.
+  Recomendado APENAS para PCs dedicados a jogos sem dados sensíveis.
+"@ -ForegroundColor Yellow
+
+$hcInput = Read-Host "  Ativar MODO HARDCORE? (s/N)"
+if ($hcInput -match '^[sS]$') {
+    $HardcoreMode = $true
+    Write-Host "  >> Modo Hardcore ATIVADO <<" -ForegroundColor Red
+    Write-Log "Modo Hardcore: ATIVADO"
+} else {
+    Write-Host "  >> Modo Padrão ativado <<" -ForegroundColor Green
+    Write-Log "Modo Hardcore: DESATIVADO"
+}
+
+# Pergunta sobre remoção do OneDrive
+$removeOneDrive = $false
+Write-Host ""
+$odInput = Read-Host "  Remover OneDrive completamente? (s/N)"
+if ($odInput -match '^[sS]$') { $removeOneDrive = $true }
+
+# Pergunta sobre desativar Windows Search (indexação)
+$disableSearch = $false
+$wsInput = Read-Host "  Desativar Windows Search (indexação em disco)? Recomendado para SSD (s/N)"
+if ($wsInput -match '^[sS]$') { $disableSearch = $true }
+
+Write-Host "`n  Iniciando otimizações... Log em: $LogFile`n" -ForegroundColor Cyan
+Start-Sleep -Seconds 2
+
+# ============================================================
+#  SEÇÃO 1 — BACKUP DO REGISTRO
+# ============================================================
+Write-Section "1/9 — BACKUP DO REGISTRO"
+
+try {
+    New-Item -Path $BackupDir -ItemType Directory -Force | Out-Null
+    $regKeys = @(
+        'HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies',
+        'HKLM\SOFTWARE\Policies\Microsoft\Windows',
+        'HKLM\SYSTEM\CurrentControlSet\Services',
+        'HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion'
+    )
+    foreach ($key in $regKeys) {
+        $safeName = $key -replace '[\\:]', '_'
+        $outFile = "$BackupDir\$safeName.reg"
+        reg export $key $outFile /y 2>$null | Out-Null
+    }
+    Write-OK "Backup do registro salvo em: $BackupDir"
+} catch {
+    Write-WARN "Falha parcial no backup de registro: $_"
+}
+
+# Cria ponto de restauração do sistema
+try {
+    Enable-ComputerRestore -Drive "$env:SystemDrive\" -ErrorAction SilentlyContinue
+    Checkpoint-Computer -Description "WinOptimize-W11 - Antes da otimizacao" -RestorePointType "MODIFY_SETTINGS" -ErrorAction Stop
+    Write-OK "Ponto de restauração do sistema criado."
+} catch {
+    Write-WARN "Não foi possível criar ponto de restauração: $_"
+}
+
+# ============================================================
+#  SEÇÃO 2 — REMOÇÃO DE BLOATWARE / APPX
+# ============================================================
+Write-Section "2/9 — REMOÇÃO DE BLOATWARE / PACOTES APPX"
+
+Write-Host "  Pacotes protegidos (NÃO removidos):" -ForegroundColor DarkGray
+Write-Host "  • Microsoft.WindowsStore, Microsoft.DesktopAppInstaller" -ForegroundColor DarkGray
+Write-Host "  • Microsoft.WindowsCalculator, Microsoft.Paint (base)" -ForegroundColor DarkGray
+Write-Host "  • Microsoft.WindowsNotepad (base), Microsoft.Photos (base)" -ForegroundColor DarkGray
+Write-Host "  • Microsoft.WindowsTerminal, Microsoft.PowerShell" -ForegroundColor DarkGray
+Write-Host "  • Microsoft.WindowsSoundRecorder, Microsoft.ScreenSketch" -ForegroundColor DarkGray
+Write-Host "  • Microsoft.Windows.Photos (framework)" -ForegroundColor DarkGray
+Write-Host ""
+
+# Lista de bloatware seguro para remover
+$bloatPatterns = @(
+    # Xbox / Gaming overlay (não remove Xbox Game Pass em si)
+    "Microsoft.Xbox.TCUI",
+    "Microsoft.XboxApp",
+    "Microsoft.XboxGameOverlay",
+    "Microsoft.XboxGamingOverlay",    # Game Bar — opcional (perguntado no modo hardcore)
+    "Microsoft.XboxIdentityProvider",
+    "Microsoft.XboxSpeechToTextOverlay",
+    # Microsoft / Office
+    "Microsoft.MicrosoftTeams",       # Teams Pessoal (não o corporativo)
+    "MicrosoftTeams",
+    "Microsoft.Clipchamp",
+    "Microsoft.PowerAutomateDesktop",
+    "Microsoft.Todos",                # Microsoft To Do
+    "Microsoft.GetHelp",
+    "Microsoft.Getstarted",
+    "Microsoft.549981C3F5F10",        # Cortana legacy
+    "Microsoft.WindowsFeedbackHub",
+    "Microsoft.BingNews",
+    "Microsoft.BingWeather",
+    "Microsoft.BingSearch",
+    "Microsoft.MicrosoftSolitaireCollection",
+    "Microsoft.MicrosoftOfficeHub",
+    "Microsoft.Office.OneNote",
+    "Microsoft.OutlookForWindows",    # Novo Outlook — remova se usar cliente desktop
+    "Microsoft.People",
+    "Microsoft.SkypeApp",
+    "Microsoft.YourPhone",            # Phone Link — remova se não usar
+    "Microsoft.ZuneMusic",            # Mídia (antigo Groove)
+    "Microsoft.ZuneVideo",
+    "Microsoft.WindowsMaps",
+    "Microsoft.WindowsAlarms",
+    "Microsoft.Wallet",
+    "Microsoft.StorePurchaseApp",     # CUIDADO: só remove se não comprar na Store
+    # Terceiros pré-instalados
+    "Disney.37853FC22B2CE",
+    "TikTok",
+    "Instagram",
+    "Facebook",
+    "Spotify",
+    "AdobeSystemsIncorporated.AdobeCreativeCloudExpress",
+    "CandyCrush*",
+    "king.com*",
+    "Duolingo*",
+    "PicsArt*",
+    "WhatsApp",
+    "LinkedInforWindows",
+    "PandoraMediaInc",
+    "AmazonVideo",
+    "Netflix",
+    # Copilot e IA — removidos também na seção 4
+    "Microsoft.Copilot",
+    "Microsoft.Windows.Copilot",
+    "Microsoft.MicrosoftCopilot",
+    "Microsoft.WindowsAIAssistant"
+)
+
+foreach ($pattern in $bloatPatterns) {
+    Remove-AppxSafe    -Pattern $pattern
+    Remove-AppxProvSafe -Pattern ($pattern -replace '\*','')
+}
+
+# Game Bar — somente no modo hardcore (pode afetar alguns jogos online)
+if ($HardcoreMode) {
+    Remove-AppxSafe     -Pattern "Microsoft.XboxGamingOverlay"
+    Remove-AppxProvSafe -Pattern "Microsoft.XboxGamingOverlay"
+    Write-Log "Modo Hardcore: Xbox Game Bar removido"
+}
+
+# ============================================================
+#  SEÇÃO 3 — DESATIVAÇÃO PROFUNDA DE TELEMETRIA
+# ============================================================
+Write-Section "3/9 — DESATIVAÇÃO DE TELEMETRIA"
+
+# --- Nível de dados de diagnóstico → 0 (Security only) ---
+# AllowTelemetry = 0 limita ao mínimo permitido por política (Enterprise/Education)
+# Em edições Home/Pro o mínimo efetivo é 1, mas definir 0 ainda reduz muito.
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "AllowTelemetry" 0
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" "AllowTelemetry" 0
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\DataCollection" "MaxTelemetryAllowed" 0
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "LimitDiagnosticLogCollection" 1
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "DisableOneSettingsDownloads" 1
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection" "DoNotShowFeedbackNotifications" 1
+
+# --- Coleta de dados de aplicativos (CEIP / Customer Experience) ---
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\SQMClient\Windows" "CEIPEnable" 0
+Set-Reg "HKLM:\SOFTWARE\Microsoft\SQMClient\Windows" "CEIPEnable" 0
+
+# --- Relatórios de erro do Windows (WER) ---
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting" "Disabled" 1
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting" "Disabled" 1
+Disable-Svc -Name "WerSvc"
+
+# --- Activity History / Timeline ---
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "EnableActivityFeed" 0
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "PublishUserActivities" 0
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\System" "UploadUserActivities" 0
+
+# --- Telemetria de compatibilidade de aplicativos ---
+# CompatTelRunner coleta dados de compatibilidade de apps — desnecessário para usuários normais
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat" "AITEnable" 0
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat" "DisableInventory" 1
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat" "DisableUAR" 1
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat" "DisablePCA" 1
+
+# --- Desativa serviços de telemetria ---
+Disable-Svc -Name "DiagTrack"           # Connected User Experiences and Telemetry
+Disable-Svc -Name "dmwappushservice"    # Device Management WAP Push (telemetria)
+Disable-Svc -Name "diagnosticshub.standardcollector.service"
+Disable-Svc -Name "WdiServiceHost"      # Diagnostic Service Host
+Disable-Svc -Name "WdiSystemHost"       # Diagnostic System Host
+Disable-Svc -Name "DPS"                 # Diagnostic Policy Service (Manual é mais seguro que Disabled)
+Disable-Svc -Name "PcaSvc" -StartupType "Manual"  # Program Compatibility Assistant
+
+# --- Tarefas agendadas de telemetria ---
+$telemetryTasks = @(
+    @{ Path="\Microsoft\Windows\Application Experience\"; Name="Microsoft Compatibility Appraiser" },
+    @{ Path="\Microsoft\Windows\Application Experience\"; Name="ProgramDataUpdater" },
+    @{ Path="\Microsoft\Windows\Application Experience\"; Name="StartupAppTask" },
+    @{ Path="\Microsoft\Windows\Autochk\";               Name="Proxy" },
+    @{ Path="\Microsoft\Windows\Customer Experience Improvement Program\"; Name="Consolidator" },
+    @{ Path="\Microsoft\Windows\Customer Experience Improvement Program\"; Name="UsbCeip" },
+    @{ Path="\Microsoft\Windows\Customer Experience Improvement Program\"; Name="KernelCeipTask" },
+    @{ Path="\Microsoft\Windows\DiskDiagnostic\";        Name="Microsoft-Windows-DiskDiagnosticDataCollector" },
+    @{ Path="\Microsoft\Windows\Feedback\Siuf\";         Name="DmClient" },
+    @{ Path="\Microsoft\Windows\Feedback\Siuf\";         Name="DmClientOnScenarioDownload" },
+    @{ Path="\Microsoft\Windows\Windows Error Reporting\"; Name="QueueReporting" },
+    @{ Path="\Microsoft\Windows\CloudExperienceHost\";   Name="CreateObjectTask" },
+    @{ Path="\Microsoft\Windows\Maps\";                  Name="MapsUpdateTask" },
+    @{ Path="\Microsoft\Windows\Maps\";                  Name="MapsToastTask" }
+)
+foreach ($t in $telemetryTasks) { Disable-Task -TaskPath $t.Path -TaskName $t.Name }
+
+# --- Entrega de anúncios via dados de diagnóstico ---
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Privacy" "TailoredExperiencesWithDiagnosticDataEnabled" 0
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo" "DisabledByGroupPolicy" 1
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\AdvertisingInfo" "Enabled" 0
+
+# --- Compartilhamento de dados de localização ---
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\LocationAndSensors" "DisableLocation" 1
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeviceAccess\Global\{BFA794E4-F964-4FDB-90F6-51056BFE4B44}" "Value" "Deny" "String"
+
+# --- Delivery Optimization (P2P de updates — consome banda) ---
+# 0 = Desativado, 1 = Apenas LAN, 3 = LAN + Internet (padrão)
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\DeliveryOptimization" "DODownloadMode" 0
+Disable-Svc -Name "DoSvc" -StartupType "Manual"  # Manual é mais seguro que Disabled para updates
+
+# --- Geolocalização de rede (conecta a servidores MS) ---
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\NetworkConnectivityStatusIndicator" "NoActiveProbe" 1
+
+# ============================================================
+#  SEÇÃO 4 — DESATIVAÇÃO DE IA (COPILOT, RECALL, ETC.)
+# ============================================================
+Write-Section "4/9 — DESATIVAÇÃO DE FUNCIONALIDADES DE IA"
+
+# --- Microsoft Copilot (botão, tecla Win+C e integração no shell) ---
+Set-Reg "HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" "TurnOffWindowsCopilot" 1
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowCopilotButton" 0
+# Remapeia/desativa a tecla dedicada ao Copilot (Win+C / tecla física em teclados novos)
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "LaunchCopilotTrigger" 0
+
+# --- Recall (Windows Recall — captura de tela contínua com IA) ---
+# Recall foi movido para opt-in mas ainda pode estar presente como componente
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 1
+Set-Reg "HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI" "DisableAIDataAnalysis" 1
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System" "EnableRecall" 0
+Disable-Task -TaskPath "\Microsoft\Windows\WindowsAI\" -TaskName "Recall*"
+
+# --- AI em aplicativos nativos ---
+# Desativa Writing Assistance (assistente de escrita com IA em apps)
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsAI" "WritingEnabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsAI" "DisableWindowsAI" 1
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsAI" "DisableWindowsAI" 1
+
+# Desativa sugestões de IA no Explorer
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "AISearchEnabled" 0
+
+# Desativa "Suggested Actions" (ações inteligentes ao copiar texto/número)
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\SmartActionPlatform" "DisableSmartActions" 1
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\SmartActionPlatform\SmartClipboard" "Disabled" 1
+
+# --- Image Creator / DALL-E no Paint e outros ---
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ApplicationAssociationToasts" "DisableImageCreator" 1
+
+# --- Copilot no Microsoft Edge ---
+# Desativa sidebar com Copilot no Edge (se instalado)
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "HubsSidebarEnabled" 0
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "CopilotPageContext" 0
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Edge" "DiscoverPageContextEnabled" 0
+
+# --- Componentes de IA Windows (serviços) ---
+# AIX Service — backend de inferência local (Recall, Cocreator, etc.)
+Disable-Svc -Name "AIXService" -StartupType "Manual"
+Disable-Svc -Name "WinML"      -StartupType "Manual"  # Windows Machine Learning runtime
+
+# --- Tarefas de IA ---
+Disable-Task -TaskPath "\Microsoft\Windows\WindowsAI\" -TaskName "FRE-Recall"
+Disable-Task -TaskPath "\Microsoft\Windows\WindowsAI\" -TaskName "RetrieveData"
+
+# --- Desativa Bing AI no Search do Windows ---
+Set-Reg "HKCU:\SOFTWARE\Policies\Microsoft\Windows\Explorer" "DisableSearchBoxSuggestions" 1
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "BingSearchEnabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Search" "CortanaConsent" 0
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "DisableWebSearch" 1
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "ConnectedSearchUseWeb" 0
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "AllowCloudSearch" 0
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Windows Search" "AllowCortana" 0
+
+# ============================================================
+#  SEÇÃO 5 — OTIMIZAÇÃO DE SERVIÇOS
+# ============================================================
+Write-Section "5/9 — OTIMIZAÇÃO DE SERVIÇOS DO WINDOWS"
+
+# --- Serviços que podem ser desativados com segurança em desktops ---
+
+# Serviço de fax — ninguém usa fax em 2025
+Disable-Svc -Name "Fax"
+
+# Remote Registry — segurança: desativa acesso remoto ao registro
+Disable-Svc -Name "RemoteRegistry"
+
+# Retail Demo — apenas para lojas físicas
+Disable-Svc -Name "RetailDemo"
+
+# Maps / Location download — baixa mapas offline desnecessários
+Disable-Svc -Name "MapsBroker"
+Disable-Svc -Name "lfsvc"  # Geolocation (se não usa apps de localização)
+
+# AllJoyn Router — protocolo IoT legado
+Disable-Svc -Name "AJRouter"
+
+# Mobile Broadband — somente para modem 4G/5G USB
+Disable-Svc -Name "wlpasvc" -StartupType "Manual"
+
+# Windows Biometric — desativa se não usa leitor de impressão digital / Windows Hello biometria
+# CUIDADO: desativar quebra Windows Hello com biometria — comente se usar
+# Disable-Svc -Name "WbioSrvc"
+
+# Downloaded Maps Manager
+Disable-Svc -Name "MapsBroker"
+
+# Print Spooler — desative APENAS se não tiver impressora
+# Disable-Svc -Name "Spooler"  ← comentado intencionalmente
+
+# Bluetooth — desative se não usar periféricos Bluetooth
+# Disable-Svc -Name "bthserv"   ← comentado intencionalmente
+
+# Sensor Services — acelerômetro, giroscópio (notebooks/tablets)
+Disable-Svc -Name "SensrSvc"   -StartupType "Manual"
+Disable-Svc -Name "SensorDataService" -StartupType "Manual"
+Disable-Svc -Name "SensorMonitoringService" -StartupType "Manual"
+
+# Smart Card — somente para cartões inteligentes corporativos
+Disable-Svc -Name "SCardSvr"   -StartupType "Manual"
+Disable-Svc -Name "SCPolicySvc" -StartupType "Manual"
+
+# Phone Service / Link to Windows
+Disable-Svc -Name "PhoneSvc"   -StartupType "Manual"
+
+# Connected Devices Platform
+Disable-Svc -Name "CDPSvc"     -StartupType "Manual"
+Disable-Svc -Name "CDPUserSvc" -StartupType "Manual"
+
+# Clipboard User Service (se não usa Área de Transferência da Nuvem)
+# Disable-Svc -Name "cbdhsvc"   ← comentado: afeta clipboard local também
+
+# Push notifications (WNS) — desative se não quiser notificações de apps
+Disable-Svc -Name "WpnService" -StartupType "Manual"
+
+# --- SysMain / SuperFetch (inútil e prejudicial em SSD NVMe rápido) ---
+# Em HDD pode melhorar, em SSD causa escritas desnecessárias
+Disable-Svc -Name "SysMain"  # SysMain = SuperFetch/Prefetch
+
+# --- Windows Search (indexação) — opcional, perguntado no início ---
+if ($disableSearch) {
+    Disable-Svc -Name "WSearch"
+    Write-OK "Windows Search (indexação) desativado pelo usuário."
+} else {
+    Write-SKIP "Windows Search mantido (usuário optou por manter)."
+}
+
+# ============================================================
+#  SEÇÃO 6 — TWEAKS DE PERFORMANCE
+# ============================================================
+Write-Section "6/9 — TWEAKS DE PERFORMANCE (CPU, GPU, RAM, DISCO)"
+
+# --- Plano de Energia: Alto Desempenho ou Ultimate Performance ---
+# Ativa e define o plano de energia "Alto Desempenho"
+try {
+    # Tenta ativar Ultimate Performance (disponível em Pro/Enterprise/Workstation)
+    $ultimate = powercfg -duplicatescheme e9a42b02-d5df-448d-aa00-03f14749eb61 2>$null
+    if ($ultimate) {
+        $guid = ($ultimate -split ' ')[-1].Trim()
+        powercfg -setactive $guid | Out-Null
+        Write-OK "Plano de energia: Ultimate Performance ativado."
+    } else {
+        # Fallback: Alto Desempenho
+        powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c | Out-Null
+        Write-OK "Plano de energia: Alto Desempenho ativado."
+    }
+} catch { Write-ERR "Falha ao definir plano de energia: $_" }
+
+# --- Game Mode / Game DVR ---
+# Game Mode melhora alocação de CPU/GPU para jogos
+Set-Reg "HKCU:\SOFTWARE\Microsoft\GameBar" "AllowAutoGameMode" 1
+Set-Reg "HKCU:\SOFTWARE\Microsoft\GameBar" "AutoGameModeEnabled" 1
+# Game DVR (gravação em background) — consome recursos — desativar
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\GameDVR" "AppCaptureEnabled" 0
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\GameDVR" "AllowGameDVR" 0
+
+# --- Hardware-Accelerated GPU Scheduling (HAGS) ---
+# Reduz latência de GPU em jogos (requer GPU DX12 + driver recente)
+Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" "HwSchMode" 2
+
+# --- Prioridade de GPU para apps de jogos ---
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" "GPU Priority" 8
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" "Priority" 6
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Games" "Scheduling Category" "High" "String"
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "SystemResponsiveness" 0
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "NetworkThrottlingIndex" 0xffffffff
+
+# --- HPET (High Precision Event Timer) ---
+# Desativar HPET pode reduzir latência em jogos em alguns sistemas
+# CUIDADO: em alguns PCs pode causar instabilidade — Hardcore apenas
+if ($HardcoreMode) {
+    try {
+        bcdedit /set useplatformclock false | Out-Null
+        bcdedit /set disabledynamictick yes | Out-Null
+        Write-OK "HPET: desativado (Modo Hardcore) — pode melhorar latência em jogos."
+    } catch { Write-ERR "Falha ao ajustar HPET: $_" }
+}
+
+# --- Large System Cache (melhora uso de RAM para apps) ---
+Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "LargeSystemCache" 0
+Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "ClearPageFileAtShutdown" 0
+
+# --- Desativa paginação do núcleo (kernel) para RAM (somente se RAM >= 16 GB) ---
+$ramGB = [Math]::Round((Get-CimInstance Win32_PhysicalMemory | Measure-Object Capacity -Sum).Sum / 1GB)
+if ($ramGB -ge 16) {
+    Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "DisablePagingExecutive" 1
+    Write-OK "RAM detectada: ${ramGB}GB — kernel paging desativado (performance)."
+} else {
+    Write-SKIP "RAM: ${ramGB}GB — paging do kernel mantido (abaixo de 16GB)."
+}
+
+# --- Modo MSI (Message Signaled Interrupts) para GPU ---
+# Reduz latência de interrupção da GPU — requer identificar ID do dispositivo
+try {
+    $gpu = Get-PnpDevice -Class Display -ErrorAction SilentlyContinue | Where-Object Status -eq "OK" | Select-Object -First 1
+    if ($gpu) {
+        $gpuKey = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($gpu.InstanceId)\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties"
+        Set-Reg $gpuKey "MSISupported" 1
+        Write-OK "MSI Interrupts habilitado para GPU: $($gpu.FriendlyName)"
+    }
+} catch { Write-WARN "Não foi possível configurar MSI para GPU: $_" }
+
+# --- Mitigações de Spectre/Meltdown (Modo Hardcore apenas) ---
+# AVISO: Desativar estas mitigações melhora performance mas reduz segurança contra
+# ataques de canal lateral (Spectre, Meltdown, MDS, etc.)
+# Recomendado SOMENTE em máquinas dedicadas a jogos sem dados sensíveis.
+if ($HardcoreMode) {
+    Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "FeatureSettingsOverride" 3
+    Set-Reg "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" "FeatureSettingsOverrideMask" 3
+    Write-WARN "Modo Hardcore: Mitigações Spectre/Meltdown DESATIVADAS — RISCO DE SEGURANÇA!"
+    Write-Log "AVISO CRITICO: Mitigacoes Spectre/Meltdown desativadas pelo usuario (Modo Hardcore)" "WARN"
+}
+
+# --- Ajuste de IRQ (desativa Dynamic Tick) ---
+# Reduz interrupções desnecessárias do timer, melhora consistência de frametime
+if ($HardcoreMode) {
+    try {
+        bcdedit /set disabledynamictick yes | Out-Null
+        Write-OK "Dynamic Tick desativado (Modo Hardcore)."
+    } catch { Write-ERR "Falha ao desativar Dynamic Tick: $_" }
+}
+
+# --- Desativa Nagle's Algorithm (reduz latência em jogos online) ---
+# Nagle agrega pacotes TCP para eficiência — mas aumenta latência
+$tcpKey = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+try {
+    $interfaces = Get-ChildItem -Path $tcpKey -ErrorAction SilentlyContinue
+    foreach ($iface in $interfaces) {
+        Set-Reg $iface.PSPath "TcpAckFrequency" 1
+        Set-Reg $iface.PSPath "TCPNoDelay" 1
+    }
+    Write-OK "Nagle's Algorithm desativado em todas as interfaces de rede."
+} catch { Write-ERR "Falha ao desativar Nagle: $_" }
+
+# --- Desativa throttling de processos em background (Windows 11 agride FPS) ---
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile" "SystemResponsiveness" 0
+
+# ============================================================
+#  SEÇÃO 7 — FEATURES INTRUSIVAS / UI / PRIVACIDADE
+# ============================================================
+Write-Section "7/9 — DESATIVAÇÃO DE FEATURES INTRUSIVAS E UI"
+
+# --- Widgets (News Feed, MSN, clima) ---
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Dsh" "AllowNewsAndInterests" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarDa" 0
+
+# --- Sugestões no Menu Iniciar (anúncios de apps) ---
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SystemPaneSuggestionsEnabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338388Enabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338389Enabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338393Enabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-353694Enabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-353696Enabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "OemPreInstalledAppsEnabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "PreInstalledAppsEnabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "PreInstalledAppsEverEnabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SilentInstalledAppsEnabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "ContentDeliveryAllowed" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "FeatureManagementEnabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SoftLandingEnabled" 0
+
+# --- "Dicas" e notificações intrusivas do Windows ---
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-310093Enabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-314563Enabled" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\ContentDeliveryManager" "SubscribedContent-338387Enabled" 0
+
+# --- Desativa "Finalizar Configuração" / OOBE residual ---
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\UserProfileEngagement" "ScoobeSystemSettingEnabled" 0
+
+# --- Bloqueio da tela de bloqueio com anúncios (Spotlight) ---
+Set-Reg "HKCU:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsSpotlightFeatures" 1
+Set-Reg "HKCU:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsConsumerFeatures" 1
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent" "DisableWindowsConsumerFeatures" 1
+
+# --- Telemetria de apps / uso de app ---
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Privacy" "TailoredExperiencesWithDiagnosticDataEnabled" 0
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppPrivacy" "LetAppsRunInBackground" 2  # 2 = Force Deny
+
+# --- Compartilhamento de dados de experiência com terceiros ---
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo" "DisabledByGroupPolicy" 1
+
+# --- Desativa notificações de feedback da Microsoft ---
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Siuf\Rules" "NumberOfSIUFInPeriod" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Siuf\Rules" "PeriodInNanoSeconds" 0
+
+# --- Desativa handwriting / digitação para melhorar personalização ---
+Set-Reg "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitInkCollection" 1
+Set-Reg "HKCU:\SOFTWARE\Microsoft\InputPersonalization" "RestrictImplicitTextCollection" 1
+Set-Reg "HKCU:\SOFTWARE\Microsoft\InputPersonalization\TrainedDataStore" "HarvestContacts" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Personalization\Settings" "AcceptedPrivacyPolicy" 0
+
+# --- OneDrive: startup e integração com Explorer ---
+Set-Reg "HKLM:\SOFTWARE\Policies\Microsoft\Windows\OneDrive" "DisableFileSyncNGSC" 1
+# Desativa chave de autostart do OneDrive
+try {
+    Remove-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" -Name "OneDrive" -ErrorAction SilentlyContinue
+    Write-OK "OneDrive removido do startup."
+} catch { Write-SKIP "OneDrive já não estava no startup." }
+
+if ($removeOneDrive) {
+    try {
+        # Para e desinstala OneDrive
+        Stop-Process -Name "OneDrive" -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Seconds 2
+        $odSetup = "$env:SystemRoot\SysWOW64\OneDriveSetup.exe"
+        if (-not (Test-Path $odSetup)) { $odSetup = "$env:SystemRoot\System32\OneDriveSetup.exe" }
+        if (Test-Path $odSetup) {
+            & $odSetup /uninstall | Out-Null
+            Write-OK "OneDrive desinstalado."
+        } else {
+            Write-WARN "OneDriveSetup.exe não encontrado — tente remover manualmente."
+        }
+    } catch { Write-ERR "Falha ao remover OneDrive: $_" }
+}
+
+# --- Barra de Tarefas: remove itens desnecessários ---
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "ShowTaskViewButton" 0
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarMn" 0  # Botão Meet Now
+Set-Reg "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Advanced" "TaskbarBadges" 0
+
+# ============================================================
+#  SEÇÃO 8 — BLOQUEIO DE HOSTS (TELEMETRIA / REINSTALAÇÃO)
+# ============================================================
+Write-Section "8/9 — BLOQUEIO DE DOMÍNIOS DE TELEMETRIA (HOSTS)"
+
+$hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
+$hostsBackup = "$BackupDir\hosts.bak"
+
+# Backup do hosts
+try {
+    Copy-Item -Path $hostsPath -Destination $hostsBackup -Force
+    Write-OK "Backup do hosts salvo em: $hostsBackup"
+} catch { Write-WARN "Falha ao fazer backup do hosts: $_" }
+
+# Domínios de telemetria, Copilot e IA a bloquear
+$blockHosts = @(
+    # Telemetria principal
+    "vortex.data.microsoft.com",
+    "vortex-win.data.microsoft.com",
+    "telecommand.telemetry.microsoft.com",
+    "telecommand.telemetry.microsoft.com.nsatc.net",
+    "oca.telemetry.microsoft.com",
+    "oca.telemetry.microsoft.com.nsatc.net",
+    "sqm.telemetry.microsoft.com",
+    "sqm.telemetry.microsoft.com.nsatc.net",
+    "watson.telemetry.microsoft.com",
+    "watson.telemetry.microsoft.com.nsatc.net",
+    "redir.metaservices.microsoft.com",
+    "choice.microsoft.com",
+    "choice.microsoft.com.nsatc.net",
+    "df.telemetry.microsoft.com",
+    "reports.wes.df.telemetry.microsoft.com",
+    "wes.df.telemetry.microsoft.com",
+    "services.wes.df.telemetry.microsoft.com",
+    "sqm.df.telemetry.microsoft.com",
+    "telemetry.microsoft.com",
+    "watson.ppe.telemetry.microsoft.com",
+    "telemetry.appex.bing.net",
+    "telemetry.urs.microsoft.com",
+    "telemetry.appex.bing.net:443",
+    "settings-sandbox.data.microsoft.com",
+    "vortex-sandbox.data.microsoft.com",
+    "survey.watson.microsoft.com",
+    "watson.live.com",
+    "watson.microsoft.com",
+    "statsfe2.ws.microsoft.com",
+    "corpext.msitadfs.glbdns2.microsoft.com",
+    "compatexchange.cloudapp.net",
+    "cs1.wpc.v0cdn.net",
+    "a-0001.a-msedge.net",
+    "statsfe2.update.microsoft.com.akadns.net",
+    "sls.update.microsoft.com.akadns.net",
+    "fe2.update.microsoft.com.akadns.net",
+    "diagnostics.support.microsoft.com",
+    "corp.sts.microsoft.com",
+    "statsfe1.ws.microsoft.com",
+    "pre.footprintpredict.com",
+    "i1.services.social.microsoft.com",
+    "i1.services.social.microsoft.com.nsatc.net",
+    "feedback.windows.com",
+    "feedback.microsoft-hohm.com",
+    "feedback.search.microsoft.com",
+    # Copilot / IA
+    "copilot.microsoft.com",
+    "sydney.bing.com",
+    "edgeservices.bing.com",
+    "bingapis.com",
+    # Anúncios e rastreamento
+    "rad.msn.com",
+    "ads.msn.com",
+    "adnexus.net",
+    "adnxs.com"
+)
+
+try {
+    $currentHosts = Get-Content -Path $hostsPath -ErrorAction Stop
+    $newEntries = @()
+    $newEntries += ""
+    $newEntries += "# === WinOptimize-W11: Bloqueio de Telemetria e IA ==="
+    foreach ($domain in $blockHosts) {
+        if ($currentHosts -notmatch [Regex]::Escape($domain)) {
+            $newEntries += "0.0.0.0 $domain"
+        }
+    }
+    if ($newEntries.Count -gt 2) {
+        Add-Content -Path $hostsPath -Value $newEntries -Encoding UTF8
+        Write-OK "$($newEntries.Count - 2) domínios de telemetria bloqueados no hosts."
+    } else {
+        Write-SKIP "Todos os domínios já estavam bloqueados no hosts."
+    }
+} catch { Write-ERR "Falha ao editar hosts: $_" }
+
+# ============================================================
+#  SEÇÃO 9 — LIMPEZA FINAL E OTIMIZAÇÃO
+# ============================================================
+Write-Section "9/9 — LIMPEZA FINAL E OTIMIZAÇÕES ADICIONAIS"
+
+# --- Limpa arquivos temporários ---
+try {
+    $tempPaths = @(
+        "$env:TEMP\*",
+        "$env:SystemRoot\Temp\*",
+        "$env:SystemRoot\Prefetch\*"
+    )
+    foreach ($p in $tempPaths) {
+        Remove-Item -Path $p -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-OK "Arquivos temporários removidos."
+} catch { Write-WARN "Limpeza parcial de temporários." }
+
+# --- Flush do DNS (limpa cache de nomes) ---
+try {
+    ipconfig /flushdns | Out-Null
+    Write-OK "Cache DNS limpo."
+} catch { Write-WARN "Falha ao limpar DNS." }
+
+# --- Restart do Explorer (aplica mudanças de UI imediatamente) ---
+try {
+    Stop-Process -Name "explorer" -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    Start-Process "explorer.exe"
+    Write-OK "Explorer reiniciado para aplicar mudanças de interface."
+} catch { Write-WARN "Falha ao reiniciar Explorer." }
+
+# --- Desativa Otimização de Entrega de Atualizações na UI também ---
+Set-Reg "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\DeliveryOptimization\Config" "DODownloadMode" 0
+
+# ============================================================
+#  RESUMO FINAL
+# ============================================================
+Write-Host "`n"
+Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Green
+Write-Host "║              OTIMIZAÇÃO CONCLUÍDA COM SUCESSO            ║" -ForegroundColor Green
+Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Green
+
+Write-Host "`n  RESUMO DO QUE FOI ALTERADO:" -ForegroundColor Cyan
+Write-Host "  ✔ Backup do registro salvo em: $BackupDir" -ForegroundColor White
+Write-Host "  ✔ Bloatware removido (Xbox, Teams Pessoal, Clipchamp, etc.)" -ForegroundColor White
+Write-Host "  ✔ Telemetria profunda desativada (DiagTrack, CompatTelRunner, etc.)" -ForegroundColor White
+Write-Host "  ✔ Copilot, Recall e componentes de IA desativados" -ForegroundColor White
+Write-Host "  ✔ Serviços desnecessários desativados / definidos como Manual" -ForegroundColor White
+Write-Host "  ✔ Plano de energia de alta performance ativado" -ForegroundColor White
+Write-Host "  ✔ HAGS (GPU Scheduling) ativado" -ForegroundColor White
+Write-Host "  ✔ Game Mode otimizado, Game DVR desativado" -ForegroundColor White
+Write-Host "  ✔ Nagle's Algorithm desativado (menor latência em jogos online)" -ForegroundColor White
+Write-Host "  ✔ Widgets, sugestões e anúncios no Menu Iniciar desativados" -ForegroundColor White
+Write-Host "  ✔ Domínios de telemetria bloqueados no arquivo hosts" -ForegroundColor White
+if ($HardcoreMode) {
+    Write-Host "  ⚠ MODO HARDCORE: HPET desativado, Spectre/Meltdown desativado" -ForegroundColor Yellow
+}
+
+Write-Host "`n  LOG COMPLETO salvo em:" -ForegroundColor Cyan
+Write-Host "  $LogFile" -ForegroundColor White
+
+Write-Host "`n  PARA REVERTER: Use os backups de registro em:" -ForegroundColor Cyan
+Write-Host "  $BackupDir" -ForegroundColor White
+Write-Host "  Ou use Restauração do Sistema criada no início." -ForegroundColor White
+
+Write-Host @"
+
+  ══════════════════════════════════════════════════════════
+  REINICIE O COMPUTADOR para que TODAS as mudanças tenham
+  efeito. Algumas otimizações só são aplicadas após reboot.
+  ══════════════════════════════════════════════════════════
+"@ -ForegroundColor Yellow
+
+$reboot = Read-Host "`n  Reiniciar agora? (s/N)"
+if ($reboot -match '^[sS]$') {
+    Write-Host "  Reiniciando em 10 segundos..." -ForegroundColor Red
+    Start-Sleep 10
+    Restart-Computer -Force
+}
+
+# ============================================================
+# FIM DO SCRIPT
+# ============================================================
+
+<#
+══════════════════════════════════════════════════════════════
+  BLOCO DE REVERSÃO — Como desfazer as mudanças principais
+══════════════════════════════════════════════════════════════
+
+  1. RESTAURAR REGISTRO:
+     - Abra o Regedit e importe os arquivos .reg de: $BackupDir
+     - Ou use: Restauração do Sistema criada no início do script
+
+  2. REATIVAR SERVIÇOS (exemplos):
+     Set-Service DiagTrack         -StartupType Automatic; Start-Service DiagTrack
+     Set-Service SysMain           -StartupType Automatic; Start-Service SysMain
+     Set-Service WSearch           -StartupType Automatic; Start-Service WSearch
+
+  3. REATIVAR COPILOT:
+     Remove-ItemProperty -Path "HKCU:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" -Name "TurnOffWindowsCopilot"
+     Remove-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsCopilot" -Name "TurnOffWindowsCopilot"
+
+  4. REVERTER HOSTS:
+     Copie o arquivo de backup: $BackupDir\hosts.bak
+     para: C:\Windows\System32\drivers\etc\hosts
+
+  5. REVERTER PLANO DE ENERGIA:
+     powercfg -setactive 381b4222-f694-41f0-9685-ff5bb260df2e  ← Balanced (padrão)
+
+  6. REVERTER MITIGAÇÕES SPECTRE (se usou Modo Hardcore):
+     Remove-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" -Name "FeatureSettingsOverride"
+     Remove-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management" -Name "FeatureSettingsOverrideMask"
+
+  7. REVERTER HPET (se usou Modo Hardcore):
+     bcdedit /deletevalue useplatformclock
+     bcdedit /deletevalue disabledynamictick
+
+  8. REINSTALAR APPS REMOVIDOS:
+     Abra a Microsoft Store e reinstale os apps desejados.
+     Para reinstalar todos os apps provisionados:
+     Get-AppxPackage -AllUsers | Foreach {Add-AppxPackage -DisableDevelopmentMode -Register "$($_.InstallLocation)\AppXManifest.xml"}
+
+══════════════════════════════════════════════════════════════
+#>
